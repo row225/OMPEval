@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <utility>
 #include <cstring>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
 
 namespace omp {
 
@@ -34,13 +36,20 @@ HandEvaluator::HandEvaluator()
 }
 
 // Initialize card constants.
-void HandEvaluator::initCardConstants()
-{
-    for (unsigned c = 0; c < CARD_COUNT; ++c) {
-        unsigned rank = c / 4, suit = c % 4;
-        Hand::CARDS[c] = Hand((1ull << (4 * suit + Hand::SUITS_SHIFT)) + (1ull << Hand::CARD_COUNT_SHIFT)
-                              + RANKS[rank], 1ull << ((3 - suit) * 16 + rank));
-    }
+void HandEvaluator::initCardConstants() {
+    tbb::parallel_for(tbb::blocked_range<unsigned>(0, CARD_COUNT),
+        [](const tbb::blocked_range<unsigned>& range) {
+            for (unsigned c = range.begin(); c < range.end(); ++c) {
+                unsigned rank = c / 4, suit = c % 4;
+                Hand::CARDS[c] = Hand(
+                    (1ull << (4 * suit + Hand::SUITS_SHIFT)) + 
+                    (1ull << Hand::CARD_COUNT_SHIFT) + 
+                    RANKS[rank],
+                    1ull << ((3 - suit) * 16 + rank)
+                );
+            }
+        }
+    );
 }
 
 // Initialize static class data.

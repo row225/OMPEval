@@ -7,8 +7,12 @@
 #include <algorithm>
 #include <utility>
 #include <cstring>
+#include <tbb/tbb.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
+
+using namespace std;
+using namespace tbb;
 
 namespace omp {
 
@@ -27,6 +31,9 @@ uint16_t* HandEvaluator::ORIG_LOOKUP = nullptr;
 uint16_t HandEvaluator::FLUSH_LOOKUP[]{};
 const unsigned HandEvaluator::MAX_KEY = 4 * RANKS[12] + 3 * RANKS[11];
 bool HandEvaluator::cardInit = (initCardConstants(), true);
+
+//mutex
+recursive_mutex _mutex;
 
 // Does a thread-safe (guaranteed by C++11) one time initialization of static data.
 HandEvaluator::HandEvaluator()
@@ -168,10 +175,26 @@ unsigned HandEvaluator::populateLookup(uint64_t ranks, unsigned ncards, unsigned
 unsigned HandEvaluator::getKey(uint64_t ranks, bool flush)
 {
     unsigned key = 0;
+    /*
     for (unsigned r = 0; r < RANK_COUNT; ++r)
         key += ((ranks >> r * 4) & 0xf) * (flush ? FLUSH_RANKS[r] : RANKS[r]);
+    */
+    key = tbb::parallel_reduce(
+        tbb::blocked_range<unsigned>(0, RANK_COUNT), 0, 
+                [&](const tbb::blocked_range<unsigned>& rg, unsigned init) {
+            for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                init +=  ((ranks >> r * 4) & 0xf) * (flush ? FLUSH_RANKS[r] : RANKS[r]);
+            }
+            return init; 
+        },
+        [](unsigned x, unsigned y) {
+        return x + y; 
+        }
+    );
+    
     return key;
 }
+
 
 // Returns index of the highest straight card or 0 when no straight.
 unsigned HandEvaluator::getBiggestStraight(uint64_t ranks)
@@ -191,29 +214,53 @@ void HandEvaluator::calculatePerfectHashOffsets()
 {
     // Store locations of all non-zero elements in original lookup table, divided into rows.
     std::vector<std::pair<size_t,std::vector<size_t>>> rows;
-    for (size_t i = 0; i < MAX_KEY + 1; ++i) {
+    
+    /*for (size_t i = 0; i < MAX_KEY + 1; ++i) {
         if (ORIG_LOOKUP[i]) {
             size_t rowIdx = i >> PERF_HASH_ROW_SHIFT;
             if (rowIdx >= rows.size())
                 rows.resize(rowIdx + 1);
             rows[rowIdx].second.push_back(i);
         }
-    }
+    }*/
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, MAX_KEY + 1),
+    [&](const tbb::blocked_range<size_t>& r) {
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                if (ORIG_LOOKUP[i]) {
+                    size_t rowIdx = i >> PERF_HASH_ROW_SHIFT;
+                    _mutex.lock();
+                    if (rowIdx >= rows.size())
+                        rows.resize(rowIdx + 1);
+                    rows[rowIdx].second.push_back(i);
+                    _mutex.unlock();
+                }
+            }
+    
+    });
 
     // Need to store the original row indexes because we need them after sorting.
+    /*
     for (size_t i = 0; i < rows.size(); ++i)
         rows[i].first = i;
+    */
+    size_t rows_size = rows.size();
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, rows_size),
+        	[&](const tbb::blocked_range<size_t>& r) {
+            		for (size_t i = r.begin(); i != r.end(); ++i) {
+						rows[i].first = i;
+            		}
+    });
 
-    // Try to fit the densest rows first. Results in slightly smaller table.
-    std::sort(rows.begin(), rows.end(), [](const std::pair<size_t,std::vector<size_t>>& lhs,
-              const std::pair<size_t,std::vector<size_t>> & rhs){
+     // Try to fit the densest rows first. Results in slightly smaller table.
+     std::sort(rows.begin(), rows.end(), [](const std::pair<size_t,std::vector<size_t>>& lhs,
+        const std::pair<size_t,std::vector<size_t>> & rhs){
         return lhs.second.size() > rhs.second.size();
     });
 
     // Goes through every row and for each of them try to find the first offset that doesn't cause any collisions with
     // previous rows. Does a very naive brute force search.
     size_t maxIdx = 0;
-    for (size_t i = 0; i < rows.size(); ++i) {
+    /**for (size_t i = 0; i < rows.size(); ++i) {
         size_t offset = 0; //-(rows[i].second[0] & PERF_HASH_COLUMN_MASK); makes no difference so let's avoid negative
         for (;;++offset) {
             bool ok = true;
@@ -235,6 +282,34 @@ void HandEvaluator::calculatePerfectHashOffsets()
             LOOKUP[newIdx] = ORIG_LOOKUP[key];
         }
     }
+    */
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, rows_size),
+        	[&](const tbb::blocked_range<size_t>& r) {
+            		for (size_t i = r.begin(); i != r.end(); ++i) {
+						size_t offset = 0; //-(rows[i].second[0] & PERF_HASH_COLUMN_MASK); makes no difference so let's avoid negative
+                        for (;;++offset) {
+                            bool ok = true;
+                            for (auto x : rows[i].second) {
+                                unsigned val = LOOKUP[(x & PERF_HASH_COLUMN_MASK) + offset];
+                                if (val && val != ORIG_LOOKUP[x]) { // Allow collisions if value is the same
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (ok)
+                                break;
+                        }
+                        //std::cout << "row=" << i << " size=" << rows[i].second.size() << " offset=" << offset << std::endl;
+                        PERF_HASH_ROW_OFFSETS[rows[i].first] = (uint32_t)(offset - (rows[i].first << PERF_HASH_ROW_SHIFT));
+                        for (size_t key : rows[i].second) {
+                            size_t newIdx = (key & PERF_HASH_COLUMN_MASK) + offset;
+                            _mutex.lock();
+                            maxIdx = std::max<size_t>(maxIdx, newIdx);
+                            _mutex.unlock();
+                            LOOKUP[newIdx] = ORIG_LOOKUP[key];
+                        }
+            		}
+    });
 
     // Output offset array.
     std::cout << "offsets: " << std::endl;
@@ -277,3 +352,4 @@ void HandEvaluator::outputTableStats(const char* name, const void* p, size_t ele
 }
 
 }
+

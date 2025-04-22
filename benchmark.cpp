@@ -6,6 +6,10 @@
 #include <chrono>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <tbb/tbb.h>
+
 #if OMP_BENCHMARK_3RD_PARTY
     // Include last because of all the badly named macros. I hate C programmers.
     #include "evaluators/SKPokerEval/SevenEval.h"
@@ -17,6 +21,7 @@
 #endif
 
 using namespace std;
+using namespace tbb;
 
 // Base class for evaluator adaptors utilizing CRTP.
 template<class TEval, class THand = nullptr_t>
@@ -236,11 +241,13 @@ private:
         cout << "Sequential evaluation" << (tSingleSuit ? " (flush hands):" : ":") <<  endl;
 
         static const unsigned END = (tSingleSuit ? 13 : 52) + TEval::CARD_OFFSET;
+        
         unsigned sum = 0;
         uint64_t count = 0;
 
         auto t1 = chrono::high_resolution_clock::now();
-
+        
+        /*
         for (unsigned i = 0; i < (tSingleSuit ? 200000 : 5); ++i) {
             for (unsigned c1 = TEval::CARD_OFFSET; c1 < END; c1++) {
                 for (unsigned c2 = c1 + 1; c2 < END; c2++) {
@@ -271,10 +278,84 @@ private:
                 }
             }
         }
+        */
+
+        unsigned suit_count = (tSingleSuit ? 200000 : 5);
+        unsigned* sums = new unsigned[suit_count*END];
+        uint64_t* counts = new uint64_t[suit_count*END];
+        //init 0
+        std::fill(sums,sums+suit_count*END,0);
+        std::fill(counts,counts+suit_count*END,0);
+
+        tbb::parallel_for(tbb::blocked_range2d<unsigned>(0, suit_count, TEval::CARD_OFFSET, END),
+        [&](const tbb::blocked_range2d<unsigned>& range) {
+            for (unsigned i = range.rows().begin(); i < range.rows().end(); ++i) {
+                    for (unsigned c1 = range.cols().begin(); c1 < range.cols().end(); ++c1) {
+                        //do parall
+                        for (unsigned c2 = c1 + 1; c2 < END; c2++) {
+                            for (unsigned c3 = c2 + 1; c3 < END; c3++) {
+                                for (unsigned c4 = c3 + 1; c4 < END; c4++) {
+                                    Hand h4;
+                                    mEval.initHand(h4);
+                                    mEval.addCard(h4, c1);
+                                    mEval.addCard(h4, c2);
+                                    mEval.addCard(h4, c3);
+                                    mEval.addCard(h4, c4);
+                                    for (unsigned c5 = c4 + 1; c5 < END; c5++) {
+                                        Hand h5 = h4;
+                                        mEval.addCard(h5, c5);
+                                        for (unsigned c6 = c5 + 1; c6 < END; c6++) {
+                                            Hand h6 = h5;
+                                            mEval.addCard(h6, c6);
+                                            for (unsigned c7 = c6 + 1; c7 < END; c7++) {
+                                                Hand h7 = h6;
+                                                mEval.addCard(h7, c7);
+                                                sums[i*END+c1] += mEval.evaluate(h7, c1, c2, c3, c4, c5, c6, c7);
+                                                ++counts[i*END+c1];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }//end of tbb parallel       
+                    } //for 2
+            }//for 1
+        });
+
+        
+        sum = tbb::parallel_reduce(
+            tbb::blocked_range<unsigned>(0, suit_count*END), 0, 
+                    [&](const tbb::blocked_range<unsigned>& rg, unsigned init) {
+                for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                    init += sums[r];
+                }
+                return init; 
+            },
+            [](unsigned x, unsigned y) {
+            return x + y; 
+            }
+        );
+
+        count = tbb::parallel_reduce(
+            tbb::blocked_range<unsigned>(0, suit_count*END), 0, 
+                    [&](const tbb::blocked_range<unsigned>& rg, uint64_t init) {
+                for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                    init += counts[r];
+                }
+                return init; 
+            },
+            [](uint64_t x, uint64_t y) {
+            return x + y; 
+            }
+        );
 
         auto t2 = chrono::high_resolution_clock::now();
         double t = 1e-9 * chrono::duration_cast<chrono::nanoseconds>(t2 - t1).count();
         cout << "   " << count << " evals  " << (1e-6 * count / t) << "M/s  " << t << "s  " << sum << endl;
+
+        delete []sums;
+        delete []counts;
+
     }
 
     // Benchmark random order evaluation using card arrays.
@@ -283,13 +364,26 @@ private:
         cout << "Random order evaluation (card arrays):" << endl;
         omp::XoroShiro128Plus rng(0);
         omp::FastUniformIntDistribution<unsigned> rnd(0, 51);
+        
         uint64_t count = 0;
         unsigned sum = 0;
+        const uint64_t ITERS = 50;
+        const uint64_t RHANDS = 10000000;
+        
+        unsigned* sums = new unsigned[ITERS*RHANDS];
+        unsigned* counts = new unsigned[ITERS*RHANDS];
+        //unsigned tests[1][1];
+        //all_sums[0][0]=0;
+        //all_counts[0][0]=0;
+        //all_sums[49][9999999]=0;
+        //all_counts[49][9999999]=0;
+        //std::fill(all_sums,all_sums+hands_count,0);
+        //std::fill(all_counts,all_counts+hands_count,0);
 
-        vector<array<uint8_t,7>> table = generateRandomHands(10000000);
+        vector<array<uint8_t,7>> table = generateRandomHands(RHANDS);
 
         auto t1 = chrono::high_resolution_clock::now();
-
+        /*
         for (int i = 0; i < 50; ++i) {
             for (auto& cards : table) {
                 Hand h;
@@ -305,10 +399,63 @@ private:
                 ++count;
             }
         }
+        */
+
+        tbb::parallel_for(tbb::blocked_range2d<uint64_t>(0, ITERS, 0, RHANDS),
+        [&](const tbb::blocked_range2d<uint64_t>& range) {
+            for (uint64_t i = range.rows().begin(); i < range.rows().end(); ++i) {
+                    for (uint64_t j = range.cols().begin(); j < range.cols().end(); ++j) {
+                        
+                        Hand h;
+                        mEval.initHand(h);
+                        mEval.addCard(h, table[j][0]);
+                        mEval.addCard(h, table[j][1]);
+                        mEval.addCard(h, table[j][2]);
+                        mEval.addCard(h, table[j][3]);
+                        mEval.addCard(h, table[j][4]);
+                        mEval.addCard(h, table[j][5]);
+                        mEval.addCard(h, table[j][6]);
+                        sums[i*RHANDS+j] = mEval.evaluate(h, table[j][0], table[j][1], table[j][2], table[j][3], table[j][4], table[j][5], table[j][6]);
+                        counts[i*RHANDS+j]=1;
+                        
+                    }
+            }
+        });
+
+        
+        sum = tbb::parallel_reduce(
+            tbb::blocked_range<unsigned>(0, ITERS*RHANDS), 0, 
+                    [&](const tbb::blocked_range<unsigned>& rg, unsigned init) {
+                for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                    init += sums[r];
+                }
+                return init; 
+            },
+            [](unsigned x, unsigned y) {
+            return x + y; 
+            }
+        );
+
+        count = tbb::parallel_reduce(
+            tbb::blocked_range<unsigned>(0, ITERS*RHANDS), 0, 
+                    [&](const tbb::blocked_range<unsigned>& rg, uint64_t init) {
+                for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                    init += counts[r];
+                }
+                return init; 
+            },
+            [](uint64_t x, uint64_t y) {
+            return x + y; 
+            }
+        );
+        
 
         auto t2 = chrono::high_resolution_clock::now();
         double t = 1e-9 * chrono::duration_cast<chrono::nanoseconds>(t2 - t1).count();
         cout << "   " << count << " evals  " << (1e-6 * count / t) << "M/s  " << t << "s  " << sum << endl;
+        
+        delete []sums;
+        delete []counts;
     }
 
     // Benchmark random order evaluation using Hand objects.
@@ -337,18 +484,64 @@ private:
             }
         }
 
+        uint64_t hands_size = table.size();
+        const uint64_t ITERS = 50;
+        unsigned* sums = new unsigned[ITERS*hands_size];
+        unsigned* counts = new unsigned[ITERS*hands_size];
+
         auto t1 = chrono::high_resolution_clock::now();
 
-        for (int i = 0; i < 50; ++i) {
+        /*
+        for (int i = 0; i < ITERS; ++i) {
             for (auto& hand: table) {
                 sum += mEval.evaluate(hand, 0, 0, 0, 0, 0, 0, 0);
                 ++count;
             }
         }
+        */
+        
+        tbb::parallel_for(tbb::blocked_range2d<uint64_t>(0, ITERS, 0, hands_size),
+        [&](const tbb::blocked_range2d<uint64_t>& range) {
+            for (uint64_t i = range.rows().begin(); i < range.rows().end(); ++i) {
+                    for (uint64_t j = range.cols().begin(); j < range.cols().end(); ++j) {
+                        sums[i*hands_size+j] = mEval.evaluate(table[j], 0, 0, 0, 0, 0, 0, 0);
+                        counts[i*hands_size+j]=1;
+                    }
+            }
+        });
+        
+        sum = tbb::parallel_reduce(
+            tbb::blocked_range<unsigned>(0, ITERS*hands_size), 0, 
+                    [&](const tbb::blocked_range<unsigned>& rg, unsigned init) {
+                for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                    init += sums[r];
+                }
+                return init; 
+            },
+            [](unsigned x, unsigned y) {
+            return x + y; 
+            }
+        );
+
+        count = tbb::parallel_reduce(
+            tbb::blocked_range<unsigned>(0, ITERS*hands_size), 0, 
+                    [&](const tbb::blocked_range<unsigned>& rg, uint64_t init) {
+                for (unsigned r = rg.begin(); r != rg.end(); ++r) {
+                    init += counts[r];
+                }
+                return init; 
+            },
+            [](uint64_t x, uint64_t y) {
+            return x + y; 
+            }
+        );
 
         auto t2 = chrono::high_resolution_clock::now();
         double t = 1e-9 * chrono::duration_cast<chrono::nanoseconds>(t2 - t1).count();
         cout << "   " << count << " evals  " << (1e-6 * count / t) << "M/s  " << t << "s  " << sum << endl;
+
+        delete []sums;
+        delete []counts;
     }
 
     // Generate a vector of random hands. The random seed is deterministic on purpose.

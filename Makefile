@@ -19,7 +19,7 @@ endif
 SRCS := $(wildcard omp/*.cpp)
 OBJS := ${SRCS:.cpp=.o}
 
-all: lib/ompeval.a test
+all: lib/ompeval.a test main
 
 lib:
 	mkdir -p lib
@@ -30,5 +30,8 @@ lib/ompeval.a: $(OBJS) | lib
 test: test.cpp benchmark.cpp lib/ompeval.a
 	$(CXX) $(CXXFLAGS) $(TBB_INCLUDE) -o $@ $^ $(TBB_LIBS) -Wl,-rpath,$(TBB_ROOT)/lib/intel64/gcc4.8
 
+main: main.cpp lib/ompeval.a
+	$(CXX) $(CXXFLAGS) $(TBB_INCLUDE) -o $@ $^ $(TBB_LIBS) -Wl,-rpath,$(TBB_ROOT)/lib/intel64/gcc4.8
+
 clean:
-	$(RM) test test.exe lib/ompeval.a $(OBJS)
+	$(RM) test test.exe main main.exe lib/ompeval.a $(OBJS)
